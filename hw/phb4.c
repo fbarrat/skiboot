@@ -3635,11 +3635,11 @@ static void phb4_create(struct dt_node *np)
 	capp_load_ucode(p);
 
 	/* Register all interrupt sources with XIVE */
-	xive_register_source(p->base_msi, p->num_irqs - 8, 16, p->int_mmio, 0,
-			     NULL, NULL);
-	xive_register_source(p->base_lsi, 8, 16,
-			     p->int_mmio + ((p->num_irqs - 8) << 16),
-			     XIVE_SRC_LSI, p, &phb4_lsi_ops);
+	xive_register_hw_source(p->base_msi, p->num_irqs - 8, 16, p->int_mmio, 0,
+				NULL, NULL);
+	xive_register_hw_source(p->base_lsi, 8, 16,
+				p->int_mmio + ((p->num_irqs - 8) << 16),
+				XIVE_SRC_LSI, p, &phb4_lsi_ops);
 
 	/* Platform additional setup */
 	if (platform.pci_setup_phb)
