@@ -2559,6 +2559,59 @@ static void phb4_init_capp_errors(struct phb4 *p)
 	out_be64(p->regs + 0x0cb0,	0x35777073ff000000ull);
 }
 
+static bool phb4_capp_timebase_sync(struct phb4 *p)
+{
+	uint64_t tfmr;
+	uint64_t capp_tb;
+	uint64_t base_tfmr;
+	int64_t delta;
+	uint32_t offset;
+	unsigned int retry = 0;
+
+	offset = PHB4_CAPP_REG_OFFSET(p);
+	base_tfmr = chiptod_get_base_tfmr();
+
+	/* Set CAPP TFMR to base tfmr value */
+	xscom_write(p->chip_id, CAPP_TFMR + offset, base_tfmr);
+
+	/* Reset CAPP TB errors before attempting the sync */
+	if (!chiptod_capp_reset_tb_errors(p->chip_id, CAPP_TFMR, offset))
+		return false;
+
+	/* Switch CAPP TB to "Not Set" state */
+	if (!chiptod_capp_mod_tb(p->chip_id, CAPP_TFMR, offset))
+		return false;
+
+	/* Sync CAPP TB with core TB, retry while difference > 16usecs */
+	do {
+		if (retry++ > 5) {
+			prerror("CAPP: TB sync: giving up!\n");
+			return false;
+		}
+
+		/* Make CAPP ready to get the TB, wait for chip sync */
+		tfmr = base_tfmr | SPR_TFMR_MOVE_CHIP_TOD_TO_TB;
+		xscom_write(p->chip_id, CAPP_TFMR + offset, tfmr);
+		if (!chiptod_wait_for_chip_sync())
+			return false;
+
+		/* Set CAPP TB from core TB */
+		xscom_write(p->chip_id, CAPP_TB + offset, mftb());
+
+		/* Wait for CAPP TFMR tb_valid bit */
+		if (!chiptod_capp_check_tb_running(p->chip_id, CAPP_TFMR, offset))
+			return false;
+
+		/* Read CAPP TB, read core TB, compare */
+		xscom_read(p->chip_id, CAPP_TB + offset, &capp_tb);
+		delta = mftb() - capp_tb;
+		if (delta < 0)
+			delta = -delta;
+	} while (tb_to_usecs(delta) > 16);
+
+	return true;
+}
+
 /* Power Bus Common Queue Registers
  * All PBCQ and PBAIB registers are accessed via SCOM
  * NestBase = 4010C00 for PEC0
@@ -2696,12 +2749,13 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	phb4_init_capp_errors(p);
 
 	phb4_init_capp_regs(p);
-#if 0
-	if (!chiptod_capp_timebase_sync(p)) { /* should not be enabled for DD1 */
+
+	/* should not be enabled for DD1 */
+	/*if (!phb4_capp_timebase_sync(p)) {
 		PHBERR(p, "CAPP: Failed to sync timebase\n");
 		return OPAL_HARDWARE;
-	}
-#endif
+	}*/
+
 	return OPAL_SUCCESS;
 }
 
