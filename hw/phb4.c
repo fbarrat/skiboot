@@ -2559,6 +2559,7 @@ static void phb4_init_capp_errors(struct phb4 *p)
 	out_be64(p->regs + 0x0cb0,	0x35777073ff000000ull);
 }
 
+#if 0
 static bool phb4_capp_timebase_sync(struct phb4 *p)
 {
 	uint64_t tfmr;
@@ -2611,6 +2612,7 @@ static bool phb4_capp_timebase_sync(struct phb4 *p)
 
 	return true;
 }
+#endif
 
 /* Power Bus Common Queue Registers
  * All PBCQ and PBAIB registers are accessed via SCOM
@@ -2750,12 +2752,13 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 
 	phb4_init_capp_regs(p);
 
+#if 0
 	/* should not be enabled for DD1 */
-	/*if (!phb4_capp_timebase_sync(p)) {
+	if (!phb4_capp_timebase_sync(p)) {
 		PHBERR(p, "CAPP: Failed to sync timebase\n");
 		return OPAL_HARDWARE;
-	}*/
-
+	}
+#endif
 	return OPAL_SUCCESS;
 }
 
