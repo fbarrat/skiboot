@@ -65,6 +65,10 @@ static void phb4_init_hw(struct phb4 *p, bool first_init);
 				      (p)->phb.opal_id, ## a)
 #define PHBERR(p, fmt, a...)	prlog(PR_ERR, "PHB%d: " fmt, \
 				      (p)->phb.opal_id, ## a)
+enum capi_dma_tvt {
+	CAPI_DMA_TVT0,
+	CAPI_DMA_TVT1
+};
 
 /* Note: The "ASB" name is historical, practically this means access via
  * the XSCOM backdoor
@@ -1281,6 +1285,23 @@ static int64_t phb4_map_pe_dma_window(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
+static uint64_t tve_encode_50b_noxlate(uint64_t start_addr, uint64_t end_addr)
+{
+	uint64_t tve;
+
+	/*
+	 * Put start address bits 49:24 into TVE[52:53]||[0:23]
+	 * and end address bits 49:24 into TVE[54:55]||[24:47]
+	 * and set TVE[51]
+	 */
+	tve  = (start_addr << 16) & (0xffffffull << 40);
+	tve |= (start_addr >> 38) & (3ull << 10);
+	tve |= (end_addr >>  8) & (0xfffffful << 16);
+	tve |= (end_addr >> 40) & (3ull << 8);
+	tve |= PPC_BIT(51) | IODA3_TVT_NON_TRANSLATE_50;
+	return tve;
+}
+
 static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
 					   uint64_t pe_number,
 					   uint16_t window_id,
@@ -1322,16 +1343,7 @@ static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
 		if (end > 0x0003ffffffffffffull)
 			return OPAL_PARAMETER;
 
-		/*
-		 * Put start address bits 49:24 into TVE[52:53]||[0:23]
-		 * and end address bits 49:24 into TVE[54:55]||[24:47]
-		 * and set TVE[51]
-		 */
-		tve  = (pci_start_addr << 16) & (0xffffffull << 48);
-		tve |= (pci_start_addr >> 38) & (3ull << 10);
-		tve |= (end >>  8) & (0xfffffful << 16);
-		tve |= (end >> 40) & (3ull << 8);
-		tve |= PPC_BIT(51) | IODA3_TVT_NON_TRANSLATE_50;
+		tve = tve_encode_50b_noxlate(pci_start_addr, end);
 	} else {
 		/* Disable */
 		tve = 0;
@@ -2628,9 +2640,10 @@ static bool phb4_capp_timebase_sync(struct phb4 *p)
  *             = 00000080 for Stack1
  *             = 000000C0 for Stack2
  */
-static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
+static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
+				enum capi_dma_tvt dma_tvt)
 {
-	uint64_t reg;
+	uint64_t reg, start_addr, end_addr;
 	/*uint64_t mbt0, mbt1;*/
 	uint32_t offset;
 	int i;
@@ -2662,7 +2675,7 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	/* Enable CAPP Mode , Set 14 CI Store buffers for CAPP, 
 	 * Set 48 Read machines for CAPP)
 	 */
-	reg = 0x8000DFFFFFFFFFFFUll;
+	reg = 0x8000DFFFFFFFFFFFull;
 	xscom_write(p->chip_id, p->pe_xscom + 0x7, reg);
 
 	/* PEC Phase 4 (PHB) registers adjustement 
@@ -2670,42 +2683,51 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	 * Init_25 - CAPI Compare/Mask
 	 */
 	out_be64(p->regs + PHB_CAPI_CMPM,
-		 0x0200FE0000000000Ull | PHB_CAPI_CMPM_ENABLE);
+		 0x0200FE0000000000ull | PHB_CAPI_CMPM_ENABLE);
 
 	/* Init_123 :  NBW Compare/Mask Register */
 	out_be64(p->regs + PHB_PBL_NBW_CMPM,
-		 0x0300FF0000000000Ull); /* should not be enabled for DD1 */
+		 0x0300FF0000000000ull); /* should not be enabled for DD1 */
 
 	/* Init_24 - ASN Compare/Mask */
 	out_be64(p->regs + PHB_PBL_ASN_CMPM,
-		 0x0400FF0000000000Ull); /* should not be enabled for DD1 */
+		 0x0400FF0000000000ull); /* should not be enabled for DD1 */
 
 	/* non-translate/50-bit mode */
 	out_be64(p->regs + PHB_XLATE_PREFIX, 0x0000000000000000Ull);
 
-	/* set tve no translate mode allow mmio window */
 	memset(p->tve_cache, 0x0, sizeof(p->tve_cache));
 
 	/*
-	 * In 50-bit non-translate mode, the fields of the TVE are
-	 * used to perform an address range check. In this mode TCE
-	 * Table Size(0) must be a '1' (TVE[51] = 1)
-	 *      PCI Addr(49:24) >= TVE[52:53]+TVE[0:23] and
-	 *      PCI Addr(49:24) < TVE[54:55]+TVE[24:47]
-	 *
-	 * TVE[51] = 1
-	 * TVE[56] = 1: 50-bit Non-Translate Mode Enable
-	 * TVE[0:23] = 0x000000
-	 * TVE[24:47] = 0xFFFFFF
-	 *
 	 * capi dma mode: CAPP DMA mode needs access to all of memory
 	 * capi mode: Allow address range (bit 14 = 1)
 	 *            0x0002000000000000: 0x0002FFFFFFFFFFFF
-	 *            TVE[52:53] = '10' and TVE[54:55] = '10'
-	 * 
-	 * --> we use capi dma mode by default
+	 *
+	 * --> we use capi with dma on TVT#0 by default
 	 */
-	p->tve_cache[pe_number * 2] =   0x000000FFFFFF1080ULL;
+	if (dma_tvt == CAPI_DMA_TVT0) {
+		/*
+		 * TVT#0: CAPI window + DMA, all memory
+		 */
+		start_addr = 0ull;
+		end_addr   = 0x0003ffffffffffffull;
+		p->tve_cache[pe_number * 2] =
+			tve_encode_50b_noxlate(start_addr, end_addr);
+	} else {
+		/*
+		 * TVT#0: CAPI window, in bypass mode
+		 * TVT#1: DMA, all memory, in bypass mode
+		 */
+		start_addr = 0x0002000000000000ull;
+		end_addr   = 0x0002FFFFFFFFFFFFull;
+		p->tve_cache[pe_number * 2] =
+		       tve_encode_50b_noxlate(start_addr, end_addr);
+
+		start_addr = (1ull << 59);
+		end_addr   = start_addr + 0x0003ffffffffffffull;
+		p->tve_cache[pe_number * 2 + 1 ] =
+		       tve_encode_50b_noxlate(start_addr, end_addr);
+	}
 
 	phb4_ioda_sel(p, IODA3_TBL_TVT, 0, true);
 	for (i = 0; i < p->tvt_size; i++)
@@ -2727,7 +2749,6 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	p->mbt_cache[0][0] = IODA3_MBT0_ENABLE |
 			     IODA3_MBT0_TYPE_M64 |
 		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
-		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
 		(p->mm0_base & IODA3_MBT0_BASE_ADDR);
 	p->mbt_cache[0][1] = IODA3_MBT1_ENABLE |
 		((~(p->mm0_size - 1)) & IODA3_MBT1_MASK) |
@@ -2736,7 +2757,6 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	p->mbt_cache[1][0] = IODA3_MBT0_ENABLE |
 			     IODA3_MBT0_TYPE_M64 |
 		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
-		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
 		(0x0002000000000000ULL & IODA3_MBT0_BASE_ADDR);
 	p->mbt_cache[1][1] = IODA3_MBT1_ENABLE |
 		(0x00ff000000000000ULL & IODA3_MBT1_MASK) |
@@ -2801,7 +2821,14 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 		return OPAL_UNSUPPORTED;
 
 	case OPAL_PHB_CAPI_MODE_CAPI:
-		return enable_capi_mode(p, pe_number);
+		return enable_capi_mode(p, pe_number, CAPI_DMA_TVT0);
+
+	case OPAL_PHB_CAPI_MODE_DMA:
+		/* shouldn't be called, enabled by default on p9 */
+		return OPAL_UNSUPPORTED;
+
+	case OPAL_PHB_CAPI_MODE_DMA_TVT1:
+		return enable_capi_mode(p, pe_number, CAPI_DMA_TVT1);
 
 	case OPAL_PHB_CAPI_MODE_SNOOP_OFF:
 		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset,
