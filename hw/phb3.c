@@ -3366,6 +3366,59 @@ static void phb3_init_capp_errors(struct phb3 *p)
 	out_be64(p->regs + PHB_LEM_ERROR_MASK,		   0x40018e2400022482);
 }
 
+static bool phb3_capp_timebase_sync(struct phb3 *p)
+{
+	uint64_t tfmr;
+	uint64_t capp_tb;
+	uint64_t base_tfmr;
+	int64_t delta;
+	uint32_t offset;
+	unsigned int retry = 0;
+
+	offset = PHB3_CAPP_REG_OFFSET(p);
+	base_tfmr = chiptod_get_base_tfmr();
+
+	/* Set CAPP TFMR to base tfmr value */
+	xscom_write(p->chip_id, CAPP_TFMR + offset, base_tfmr);
+
+	/* Reset CAPP TB errors before attempting the sync */
+	if (!chiptod_capp_reset_tb_errors(p->chip_id, CAPP_TFMR, offset))
+		return false;
+
+	/* Switch CAPP TB to "Not Set" state */
+	if (!chiptod_capp_mod_tb(p->chip_id, CAPP_TFMR, offset))
+		return false;
+
+	/* Sync CAPP TB with core TB, retry while difference > 16usecs */
+	do {
+		if (retry++ > 5) {
+			prerror("CAPP: TB sync: giving up!\n");
+			return false;
+		}
+
+		/* Make CAPP ready to get the TB, wait for chip sync */
+		tfmr = base_tfmr | SPR_TFMR_MOVE_CHIP_TOD_TO_TB;
+		xscom_write(p->chip_id, CAPP_TFMR + offset, tfmr);
+		if (!chiptod_wait_for_chip_sync())
+			return false;
+
+		/* Set CAPP TB from core TB */
+		xscom_write(p->chip_id, CAPP_TB + offset, mftb());
+
+		/* Wait for CAPP TFMR tb_valid bit */
+		if (!chiptod_capp_check_tb_running(p->chip_id, CAPP_TFMR, offset))
+			return false;
+
+		/* Read CAPP TB, read core TB, compare */
+		xscom_read(p->chip_id, CAPP_TB + offset, &capp_tb);
+		delta = mftb() - capp_tb;
+		if (delta < 0)
+			delta = -delta;
+	} while (tb_to_usecs(delta) > 16);
+
+	return true;
+}
+
 #define PE_CAPP_EN 0x9013c03
 
 #define PE_REG_OFFSET(p) \
@@ -3484,7 +3537,7 @@ static int64_t enable_capi_mode(struct phb3 *p, uint64_t pe_number, bool dma_mod
 
 	phb3_init_capp_regs(p, dma_mode);
 
-	if (!chiptod_capp_timebase_sync(p)) {
+	if (!phb3_capp_timebase_sync(p)) {
 		PHBERR(p, "CAPP: Failed to sync timebase\n");
 		return OPAL_HARDWARE;
 	}
