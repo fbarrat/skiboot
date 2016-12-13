@@ -3602,6 +3602,10 @@ static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
 	case OPAL_PHB_CAPI_MODE_DMA:
 		return enable_capi_mode(p, pe_number, true);
 
+	case OPAL_PHB_CAPI_MODE_DMA_TVT1:
+		/* Only supported on p9/phb4 */
+		return OPAL_UNSUPPORTED;
+
 	case OPAL_PHB_CAPI_MODE_SNOOP_OFF:
 		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset,
 			    0x0000000000000000);
