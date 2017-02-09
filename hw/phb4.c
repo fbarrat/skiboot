@@ -49,6 +49,7 @@
 #include <phb4.h>
 #include <phb4-regs.h>
 #include <phb4-capp.h>
+#include <capp.h>
 #include <fsp.h>
 #include <chip.h>
 #include <chiptod.h>
@@ -2592,6 +2593,11 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 	uint64_t reg;
 	uint32_t offset;
 
+	if (!capp_ucode_loaded(chip, p->index)) {
+		PHBERR(p, "CAPP: ucode not loaded\n");
+		return OPAL_RESOURCE;
+	}
+
 	lock(&capi_lock);
 	/* Only PHB0 and PHB3 have the PHB/CAPP I/F so CAPI Adapters can
 	 * be connected to whether PEC0 or PEC2. Single port CAPI adapter
@@ -3504,6 +3510,15 @@ static void phb4_create(struct dt_node *np)
 
 	/* Get the HW up and running */
 	phb4_init_hw(p, true);
+
+	/* Load capp microcode into capp unit */
+	capp_load_ucode(p->index, p->chip_id, PHB4_CAPP_MAX_PHB_INDEX,
+			0x4341505050534C4C, PHB4_CAPP_REG_OFFSET(p),
+			p->phb.opal_id,
+			CAPP_APC_MASTER_ARRAY_ADDR_REG,
+			CAPP_APC_MASTER_ARRAY_WRITE_REG,
+			CAPP_SNP_ARRAY_ADDR_REG,
+			CAPP_SNP_ARRAY_WRITE_REG);
 
 	/* Register all interrupt sources with XIVE */
 	xive_register_hw_source(p->base_msi, p->num_irqs - 8, 16,
