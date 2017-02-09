@@ -48,7 +48,7 @@
 #include <affinity.h>
 #include <phb4.h>
 #include <phb4-regs.h>
-#include <capp.h>
+#include <phb4-capp.h>
 #include <fsp.h>
 #include <chip.h>
 #include <chiptod.h>
@@ -1976,6 +1976,8 @@ static int64_t phb4_freset(struct pci_slot *slot)
 	return OPAL_HARDWARE;
 }
 
+extern struct lock capi_lock;
+
 static int64_t phb4_creset(struct pci_slot *slot)
 {
 	struct phb4 *p = phb_to_phb4(slot->phb);
@@ -2374,6 +2376,265 @@ static int64_t phb4_get_diag_data(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
+static void phb4_init_capp_regs(struct phb4 *p)
+{
+	uint64_t reg;
+	uint32_t offset;
+
+	offset = PHB4_CAPP_REG_OFFSET(p);
+
+	/* enable combined response examination (set by initfile) */
+	xscom_read(p->chip_id, APC_MASTER_PB_CTRL + offset, &reg);
+	reg |= PPC_BIT(0);
+	xscom_write(p->chip_id, APC_MASTER_PB_CTRL + offset, reg);
+
+	/* Set PHB mode, HPC Dir State and P9 mode */
+	xscom_write(p->chip_id, APC_MASTER_CAPI_CTRL + offset, 0x1072000000000000);
+	PHBINF(p, "CAPP: port attached\n");
+
+	/* should be enabled on LCO shifts only */
+	/* xscom_write(p->chip_id, LCO_MASTER_TARGET + offset, 0xFFF2000000000000); */
+
+	/* Set snoop ttype decoding , dir size to 256k */
+	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0xA000000000000000);
+
+	/* Use Read Epsilon Tier2 for all scopes, Address Pipeline Master
+	 * Wait Count to highest(1023) and Number of rpt_hang.data to 3
+	 */
+	xscom_write(p->chip_id, SNOOP_CONTROL + offset, 0x8000000010072000);
+
+	/* TLBI Hang Divider = 1 (initfile).  LPC buffers=0. X16 PCIe(14 buffers) */
+	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x401404000400000B);
+
+	/* Enable epoch timer */
+	xscom_write(p->chip_id, EPOCH_RECOVERY_TIMERS_CTRL + offset, 0xC0000000FFF0FFE0);
+
+	/* Deassert TLBI_FENCED and tlbi_psl_is_dead */
+	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, 0);
+
+	xscom_write(p->chip_id, FLUSH_SUE_STATE_MAP + offset,
+		    0x1DCF5F6600000000);
+	xscom_write(p->chip_id, FLUSH_SUE_UOP1 + offset,
+		    0xE3105005C8000000);
+	xscom_write(p->chip_id, APC_FSM_READ_MASK + offset,
+		    0xFFFFFFFFFFFF0000);
+	xscom_write(p->chip_id, XPT_FSM_RMM + offset,
+		    0xFFFFFFFFFFFF0000);
+}
+
+/* override some inits with CAPI defaults */
+static void phb4_init_capp_errors(struct phb4 *p)
+{
+	out_be64(p->regs + 0x0d30,	0xdff7ff0bf7ddfff0ull);
+	out_be64(p->regs + 0x0db0,	0xfbffd7bbff7fbfefull);
+	out_be64(p->regs + 0x0e30,	0xfffffeffff7fff57ull);
+	out_be64(p->regs + 0x0eb0,	0xfbaeffaf00000000ull);
+	out_be64(p->regs + 0x0cb0,	0x35777073ff000000ull);
+}
+
+/* Power Bus Common Queue Registers
+ * All PBCQ and PBAIB registers are accessed via SCOM
+ * NestBase = 4010C00 for PEC0
+ *            4011000 for PEC1
+ *            4011400 for PEC2
+ *
+ * Some registers are shared amongst all of the stacks and will only
+ * have 1 copy. Other registers are implemented one per stack.
+ * Registers that are duplicated will have an additional offset
+ * of “StackBase” so that they have a unique address.
+ * Stackoffset = 00000040 for Stack0
+ *             = 00000080 for Stack1
+ *             = 000000C0 for Stack2
+ */
+static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
+{
+	uint64_t reg;
+	/*uint64_t mbt0, mbt1;*/
+	uint32_t offset;
+	int i;
+
+	xscom_read(p->chip_id, p->pe_xscom + 0x7, &reg);
+	if (reg & PPC_BIT(0))
+		PHBDBG(p, "Already in CAPP mode\n");
+
+	/* PEC Phase 3 (PBCQ) registers Init */
+	/* poll cqstat */
+	offset = 0x40;
+	if (p->index > 0 && p->index < 3)
+		offset = 0x80;
+	else if (p->index > 2)
+		offset = 0xC0;
+
+	for (i = 0; i < 500000; i++) {
+		xscom_read(p->chip_id, p->pe_xscom + offset + 0xC, &reg);
+		if (!(reg & 0xC000000000000000))
+			break;
+		time_wait_us(10);
+	}
+	if (reg & 0xC000000000000000) {
+		PHBERR(p, "CAPP: Timeout waiting for pending transaction\n");
+		return OPAL_HARDWARE;
+	}
+
+	/* Enable CAPP Mode , Set 14 CI Store buffers for CAPP,
+	 * Set 48 Read machines for CAPP)
+	 */
+	reg = 0x8000DFFFFFFFFFFFUll;
+	xscom_write(p->chip_id, p->pe_xscom + 0x7, reg);
+
+	/* PEC Phase 4 (PHB) registers adjustement
+	 * Bit [0:7] XSL_DSNCTL[capiind]
+	 * Init_25 - CAPI Compare/Mask
+	 */
+	out_be64(p->regs + PHB_CAPI_CMPM,
+		 0x0200FE0000000000Ull | PHB_CAPI_CMPM_ENABLE);
+
+	if (!(p->rev == PHB4_REV_NIMBUS_DD10)) {
+		/* Init_123 :  NBW Compare/Mask Register */
+		out_be64(p->regs + PHB_PBL_NBW_CMPM,
+			 0x0300FF0000000000Ull);
+
+		/* Init_24 - ASN Compare/Mask */
+		out_be64(p->regs + PHB_PBL_ASN_CMPM,
+			 0x0400FF0000000000Ull);
+	}
+
+	/* non-translate/50-bit mode */
+	out_be64(p->regs + PHB_XLATE_PREFIX, 0x0000000000000000Ull);
+
+	/* set tve no translate mode allow mmio window */
+	memset(p->tve_cache, 0x0, sizeof(p->tve_cache));
+
+	/*
+	 * In 50-bit non-translate mode, the fields of the TVE are
+	 * used to perform an address range check. In this mode TCE
+	 * Table Size(0) must be a '1' (TVE[51] = 1)
+	 *      PCI Addr(49:24) >= TVE[52:53]+TVE[0:23] and
+	 *      PCI Addr(49:24) < TVE[54:55]+TVE[24:47]
+	 *
+	 * TVE[51] = 1
+	 * TVE[56] = 1: 50-bit Non-Translate Mode Enable
+	 * TVE[0:23] = 0x000000
+	 * TVE[24:47] = 0xFFFFFF
+	 *
+	 * capi dma mode: CAPP DMA mode needs access to all of memory
+	 * capi mode: Allow address range (bit 14 = 1)
+	 *            0x0002000000000000: 0x0002FFFFFFFFFFFF
+	 *            TVE[52:53] = '10' and TVE[54:55] = '10'
+	 *
+	 * --> we use capi dma mode by default
+	 */
+	p->tve_cache[pe_number * 2]  = PPC_BIT(51);
+	p->tve_cache[pe_number * 2] |= IODA3_TVT_NON_TRANSLATE_50;
+	p->tve_cache[pe_number * 2] |= (0xfffffful << 16);
+
+	phb4_ioda_sel(p, IODA3_TBL_TVT, 0, true);
+	for (i = 0; i < p->tvt_size; i++)
+		out_be64(p->regs + PHB_IODA_DATA0, p->tve_cache[i]);
+
+	/* set mbt bar to pass capi mmio window. First applied cleared
+	 * values to HW
+	 */
+	for (i = 0; i < p->mbt_size; i++) {
+		p->mbt_cache[i][0] = 0;
+		p->mbt_cache[i][1] = 0;
+	}
+	phb4_ioda_sel(p, IODA3_TBL_MBT, 0, true);
+	for (i = 0; i < p->mbt_size; i++) {
+		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][0]);
+		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][1]);
+	}
+
+	p->mbt_cache[0][0] = IODA3_MBT0_ENABLE |
+			     IODA3_MBT0_TYPE_M64 |
+		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
+		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
+		(p->mm0_base & IODA3_MBT0_BASE_ADDR);
+	p->mbt_cache[0][1] = IODA3_MBT1_ENABLE |
+		((~(p->mm0_size - 1)) & IODA3_MBT1_MASK) |
+		SETFIELD(IODA3_MBT1_SINGLE_PE_NUM, 0ull, pe_number);
+
+	p->mbt_cache[1][0] = IODA3_MBT0_ENABLE |
+			     IODA3_MBT0_TYPE_M64 |
+		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
+		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
+		(0x0002000000000000ULL & IODA3_MBT0_BASE_ADDR);
+	p->mbt_cache[1][1] = IODA3_MBT1_ENABLE |
+		(0x00ff000000000000ULL & IODA3_MBT1_MASK) |
+		SETFIELD(IODA3_MBT1_SINGLE_PE_NUM, 0ull, pe_number);
+
+	phb4_ioda_sel(p, IODA3_TBL_MBT, 0, true);
+	for (i = 0; i < p->mbt_size; i++) {
+		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][0]);
+		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][1]);
+	}
+
+	phb4_init_capp_errors(p);
+
+	phb4_init_capp_regs(p);
+
+	if (!(p->rev == PHB4_REV_NIMBUS_DD10)) {
+		if (!chiptod_capp_timebase_sync(p->chip_id, CAPP_TFMR,
+						CAPP_TB,
+						PHB4_CAPP_REG_OFFSET(p))) {
+			PHBERR(p, "CAPP: Failed to sync timebase\n");
+			return OPAL_HARDWARE;
+		}
+	}
+	return OPAL_SUCCESS;
+}
+
+static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
+				  uint64_t pe_number)
+{
+	struct phb4 *p = phb_to_phb4(phb);
+	struct proc_chip *chip = get_chip(p->chip_id);
+	uint64_t reg;
+	uint32_t offset;
+
+	lock(&capi_lock);
+	/* Only PHB0 and PHB3 have the PHB/CAPP I/F so CAPI Adapters can
+	 * be connected to whether PEC0 or PEC2. Single port CAPI adapter
+	 * can be connected to either PEC0 or PEC2, but Dual-Port Adapter
+	 * can be only connected to PEC2
+	 */
+	chip->capp_phb4_attached_mask |= 1 << p->index;
+	unlock(&capi_lock);
+
+	offset = PHB4_CAPP_REG_OFFSET(p);
+	xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, &reg);
+	if ((reg & PPC_BIT(5))) {
+		PHBERR(p, "CAPP: recovery failed (%016llx)\n", reg);
+		return OPAL_HARDWARE;
+	} else if ((reg & PPC_BIT(0)) && (!(reg & PPC_BIT(1)))) {
+		PHBDBG(p, "CAPP: recovery in progress\n");
+		return OPAL_BUSY;
+	}
+
+	switch (mode) {
+	case OPAL_PHB_CAPI_MODE_PCIE:
+		return OPAL_UNSUPPORTED;
+
+	case OPAL_PHB_CAPI_MODE_CAPI:
+		return enable_capi_mode(p, pe_number);
+
+	case OPAL_PHB_CAPI_MODE_SNOOP_OFF:
+		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset,
+			    0x0000000000000000);
+		return OPAL_SUCCESS;
+
+	case OPAL_PHB_CAPI_MODE_SNOOP_ON:
+		xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset,
+			    0x0000000000000000);
+		reg = 0xA1F0000000000000;
+		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, reg);
+
+		return OPAL_SUCCESS;
+	}
+
+	return OPAL_UNSUPPORTED;
+}
+
 static const struct phb_ops phb4_ops = {
 	.cfg_read8		= phb4_pcicfg_read8,
 	.cfg_read16		= phb4_pcicfg_read16,
@@ -2405,6 +2666,7 @@ static const struct phb_ops phb4_ops = {
 	.get_diag_data		= NULL,
 	.get_diag_data2		= phb4_get_diag_data,
 	.tce_kill		= phb4_tce_kill,
+	.set_capi_mode		= phb4_set_capi_mode,
 };
 
 static void phb4_init_ioda3(struct phb4 *p)
