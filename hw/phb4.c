@@ -70,6 +70,73 @@ enum capi_dma_tvt {
 	CAPI_DMA_TVT1
 };
 
+#define CAPP_MAX_FILTER		16
+#define CAPP_LPID_MASK		((1 << 12) - 1)
+#define CAPP_PID_MASK		((1 << 20) - 1)
+enum capp_filter_type {
+	CAPP_FILTER_LPID,
+	CAPP_FILTER_PID,
+};
+static int64_t capp_set_filter(struct phb4 *p, uint8_t num,
+			bool enable, enum capp_filter_type level,
+			uint32_t lpid, uint32_t pid)
+{
+	uint64_t reg;
+	uint32_t reg_offset;
+
+	if (num >= CAPP_MAX_FILTER)
+		return OPAL_PARAMETER;
+	if (level != CAPP_FILTER_LPID && level != CAPP_FILTER_PID)
+		return OPAL_PARAMETER;
+
+	reg_offset = PHB4_CAPP_REG_OFFSET(p);
+	reg = 0;
+	if (enable)
+		reg |= PPC_BIT(0);
+	reg |= lpid & CAPP_LPID_MASK;
+	if (level == CAPP_FILTER_PID) {
+		reg |= PPC_BIT(1);
+		reg |= (pid & CAPP_PID_MASK) << 12;
+	}
+	xscom_write(p->chip_id, TLBIE_FILTER + num + reg_offset, reg);
+	return OPAL_SUCCESS;
+}
+
+static int64_t capp_clear_all_filters(struct phb4 *p)
+{
+	uint8_t i;
+	int64_t rc, rc2;
+
+	/*
+	 * CAPP filtering is enabled as soon as there's at least 1 valid
+	 * filter defined. So disable all filters, so that the CAPP
+	 * lets all invalidations through.
+	 */
+	rc = OPAL_SUCCESS;
+	for (i = 0; i < CAPP_MAX_FILTER; i++) {
+		rc2 = capp_set_filter(p, i, false, CAPP_FILTER_PID, 0, 0);
+		if (rc2)
+			rc = rc2;
+	}
+	return rc;
+}
+
+static int64_t capp_filter_all(struct phb4 *p)
+{
+	int64_t rc;
+
+	/*
+	 * We need to have one filter in place (otherwise filtering is off and
+	 * CAPP forwards all invalidations) but it has to be bogus so nothing
+	 * gets through.
+	 */
+	rc = capp_clear_all_filters(p);
+	if (rc)
+		return rc;
+	rc = capp_set_filter(p, 0, true, CAPP_FILTER_PID, 0, -1);
+	return rc;
+}
+
 /* Note: The "ASB" name is historical, practically this means access via
  * the XSCOM backdoor
  */
@@ -2827,9 +2894,7 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 		return enable_capi_mode(p, pe_number, CAPI_DMA_TVT1);
 
 	case OPAL_PHB_CAPI_MODE_SNOOP_OFF:
-		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset,
-			    0x0000000000000000);
-		return OPAL_SUCCESS;
+		return capp_filter_all(p);
 
 	case OPAL_PHB_CAPI_MODE_SNOOP_ON:
 		xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset,
@@ -2837,7 +2902,7 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 		reg = 0xA1F0000000000000;
 		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, reg);
 
-		return OPAL_SUCCESS;
+		return capp_clear_all_filters(p);
 	}
 
 	return OPAL_UNSUPPORTED;
