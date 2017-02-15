@@ -37,6 +37,7 @@
 #define FLUSH_SUE_UOP1				0x2010843  /* S2 */
 #define APC_FSM_READ_MASK			0x2010823
 #define XPT_FSM_RMM				0x2010831
+#define TLBIE_FILTER				0x2010870  /* S2 */
 
 /* CAPP0 attached to PHB0(PEC0 - single port)
  * CAPP1 attached to PHB3(PEC2 - single or dual port)
