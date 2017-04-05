@@ -76,6 +76,84 @@ static void phb4_init_hw(struct phb4 *p, bool first_init);
 #define PHBLOGCFG(p, fmt, a...) do {} while (0)
 #endif
 
+#define CAPP_MAX_FILTERS	16
+#define CAPP_LPID_MASK		((1 << 12) - 1)
+#define CAPP_PID_MASK		((1 << 20) - 1)
+
+enum capp_filter_type {
+	CAPP_FILTER_LPID,
+	CAPP_FILTER_PID,
+};
+
+enum capi_dma_tvt {
+	CAPI_DMA_TVT0,
+	CAPI_DMA_TVT1,
+};
+
+/*
+ * Though the following functions are for capp related functions, they
+ * are only avaible on p9, so keep them here for the time being
+ */
+static int64_t capp_set_filter(struct phb4 *p, uint8_t num,
+			bool enable, enum capp_filter_type level,
+			uint32_t lpid, uint32_t pid)
+{
+	uint64_t reg, rc;
+	uint32_t reg_offset;
+
+	if (num >= CAPP_MAX_FILTERS)
+		return OPAL_PARAMETER;
+	if (level != CAPP_FILTER_LPID && level != CAPP_FILTER_PID)
+		return OPAL_PARAMETER;
+
+	reg_offset = PHB4_CAPP_REG_OFFSET(p);
+	reg = 0;
+	if (enable)
+		reg |= PPC_BIT(0);
+	reg |= lpid & CAPP_LPID_MASK;
+	if (level == CAPP_FILTER_PID) {
+		reg |= PPC_BIT(1);
+		reg |= (pid & CAPP_PID_MASK) << 12;
+	}
+	rc = xscom_write(p->chip_id, TLBIE_FILTER + num + reg_offset, reg);
+	return rc;
+}
+
+static int64_t capp_clear_all_filters(struct phb4 *p)
+{
+	uint8_t i;
+	int64_t rc, rc2;
+
+	/*
+	 * CAPP filtering is enabled as soon as there's at least 1 valid
+	 * filter defined. So disable all filters, so that the CAPP
+	 * lets all invalidations through.
+	 */
+	rc = OPAL_SUCCESS;
+	for (i = 0; i < CAPP_MAX_FILTERS; i++) {
+		rc2 = capp_set_filter(p, i, false, CAPP_FILTER_PID, 0, 0);
+		if (rc2)
+			rc = rc2;
+	}
+	return rc;
+}
+
+static int64_t capp_filter_all(struct phb4 *p)
+{
+	int64_t rc;
+
+	/*
+	 * We need to have one filter in place (otherwise filtering is off and
+	 * CAPP forwards all invalidations) but it has to be bogus so nothing
+	 * gets through.
+	 */
+	rc = capp_clear_all_filters(p);
+	if (rc)
+		return rc;
+	rc = capp_set_filter(p, 0, true, CAPP_FILTER_PID, 0, -1);
+	return rc;
+}
+
 /* Note: The "ASB" name is historical, practically this means access via
  * the XSCOM backdoor
  */
@@ -1285,6 +1363,23 @@ static int64_t phb4_map_pe_dma_window(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
+static uint64_t tve_encode_50b_noxlate(uint64_t start_addr, uint64_t end_addr)
+{
+	uint64_t tve;
+
+	/*
+	 * Put start address bits 49:24 into TVE[52:53]||[0:23]
+	 * and end address bits 49:24 into TVE[54:55]||[24:47]
+	 * and set TVE[51]
+	 */
+	tve  = (start_addr << 16) & (0xffffffull << 40);
+	tve |= (start_addr >> 38) & (3ull << 10);
+	tve |= (end_addr >>  8) & (0xfffffful << 16);
+	tve |= (end_addr >> 40) & (3ull << 8);
+	tve |= PPC_BIT(51) | IODA3_TVT_NON_TRANSLATE_50;
+	return tve;
+}
+
 static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
 					   uint64_t pe_number,
 					   uint16_t window_id,
@@ -1326,16 +1421,7 @@ static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
 		if (end > 0x0003ffffffffffffull)
 			return OPAL_PARAMETER;
 
-		/*
-		 * Put start address bits 49:24 into TVE[52:53]||[0:23]
-		 * and end address bits 49:24 into TVE[54:55]||[24:47]
-		 * and set TVE[51]
-		 */
-		tve  = (pci_start_addr << 16) & (0xffffffull << 40);
-		tve |= (pci_start_addr >> 38) & (3ull << 10);
-		tve |= (end >>  8) & (0xfffffful << 16);
-		tve |= (end >> 40) & (3ull << 8);
-		tve |= PPC_BIT(51) | IODA3_TVT_NON_TRANSLATE_50;
+		tve = tve_encode_50b_noxlate(pci_start_addr, end);
 	} else {
 		/* Disable */
 		tve = 0;
@@ -1968,7 +2054,7 @@ static int64_t capp_load_ucode(struct phb4 *p)
 {
 	int64_t rc;
 
-	if (p->index != 0 && p->index != 2)
+	if (p->index != 0 && p->index != 3)
 		return OPAL_HARDWARE;
 
 	rc = _capp_load_ucode(p->chip_id, p->phb.opal_id, p->index,
@@ -2457,9 +2543,10 @@ static void phb4_init_capp_errors(struct phb4 *p)
  *             = 00000080 for Stack1
  *             = 000000C0 for Stack2
  */
-static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
+static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
+				enum capi_dma_tvt dma_tvt)
 {
-	uint64_t reg;
+	uint64_t reg, start_addr, end_addr;
 	uint32_t offset;
 	int i;
 
@@ -2512,31 +2599,31 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	/* non-translate/50-bit mode */
 	out_be64(p->regs + PHB_XLATE_PREFIX, 0x0000000000000000Ull);
 
-	/* set tve no translate mode allow mmio window */
 	memset(p->tve_cache, 0x0, sizeof(p->tve_cache));
 
-	/*
-	 * In 50-bit non-translate mode, the fields of the TVE are
-	 * used to perform an address range check. In this mode TCE
-	 * Table Size(0) must be a '1' (TVE[51] = 1)
-	 *      PCI Addr(49:24) >= TVE[52:53]+TVE[0:23] and
-	 *      PCI Addr(49:24) < TVE[54:55]+TVE[24:47]
-	 *
-	 * TVE[51] = 1
-	 * TVE[56] = 1: 50-bit Non-Translate Mode Enable
-	 * TVE[0:23] = 0x000000
-	 * TVE[24:47] = 0xFFFFFF
-	 *
-	 * capi dma mode: CAPP DMA mode needs access to all of memory
-	 * capi mode: Allow address range (bit 14 = 1)
-	 *            0x0002000000000000: 0x0002FFFFFFFFFFFF
-	 *            TVE[52:53] = '10' and TVE[54:55] = '10'
-	 *
-	 * --> we use capi dma mode by default
-	 */
-	p->tve_cache[pe_number * 2]  = PPC_BIT(51);
-	p->tve_cache[pe_number * 2] |= IODA3_TVT_NON_TRANSLATE_50;
-	p->tve_cache[pe_number * 2] |= (0xfffffful << 16);
+	if (dma_tvt == CAPI_DMA_TVT0) {
+		/*
+		 * TVT#0: CAPI window + DMA, all memory
+		 */
+		start_addr = 0ull;
+		end_addr   = 0x0003ffffffffffffull;
+		p->tve_cache[pe_number * 2] =
+			tve_encode_50b_noxlate(start_addr, end_addr);
+	} else {
+		/*
+		 * TVT#0: CAPI window, in bypass mode
+		 * TVT#1: DMA, all memory, in bypass mode
+		 */
+		start_addr = 0x0002000000000000ull;
+		end_addr   = 0x0002FFFFFFFFFFFFull;
+		p->tve_cache[pe_number * 2] =
+			tve_encode_50b_noxlate(start_addr, end_addr);
+
+		start_addr = (1ull << 59);
+		end_addr   = start_addr + 0x0003ffffffffffffull;
+		p->tve_cache[pe_number * 2 + 1] =
+			tve_encode_50b_noxlate(start_addr, end_addr);
+	}
 
 	phb4_ioda_sel(p, IODA3_TBL_TVT, 0, true);
 	for (i = 0; i < p->tvt_size; i++)
@@ -2558,7 +2645,6 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	p->mbt_cache[0][0] = IODA3_MBT0_ENABLE |
 			     IODA3_MBT0_TYPE_M64 |
 		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
-		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
 		(p->mm0_base & IODA3_MBT0_BASE_ADDR);
 	p->mbt_cache[0][1] = IODA3_MBT1_ENABLE |
 		((~(p->mm0_size - 1)) & IODA3_MBT1_MASK) |
@@ -2567,7 +2653,6 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number)
 	p->mbt_cache[1][0] = IODA3_MBT0_ENABLE |
 			     IODA3_MBT0_TYPE_M64 |
 		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
-		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
 		(0x0002000000000000ULL & IODA3_MBT0_BASE_ADDR);
 	p->mbt_cache[1][1] = IODA3_MBT1_ENABLE |
 		(0x00ff000000000000ULL & IODA3_MBT1_MASK) |
@@ -2626,12 +2711,17 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 		return OPAL_UNSUPPORTED;
 
 	case OPAL_PHB_CAPI_MODE_CAPI:
-		return enable_capi_mode(p, pe_number);
+		return enable_capi_mode(p, pe_number, CAPI_DMA_TVT0);
+
+	case OPAL_PHB_CAPI_MODE_DMA:
+		/* shouldn't be called, enabled by default on p9 */
+		return OPAL_UNSUPPORTED;
+
+	case OPAL_PHB_CAPI_MODE_DMA_TVT1:
+		return enable_capi_mode(p, pe_number, CAPI_DMA_TVT1);
 
 	case OPAL_PHB_CAPI_MODE_SNOOP_OFF:
-		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset,
-			    0x0000000000000000);
-		return OPAL_SUCCESS;
+		return capp_filter_all(p);
 
 	case OPAL_PHB_CAPI_MODE_SNOOP_ON:
 		xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset,
@@ -2639,7 +2729,7 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 		reg = 0xA000000000000000;
 		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, reg);
 
-		return OPAL_SUCCESS;
+		return capp_clear_all_filters(p);
 	}
 
 	return OPAL_UNSUPPORTED;

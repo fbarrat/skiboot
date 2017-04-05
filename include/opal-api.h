@@ -1057,6 +1057,7 @@ enum {
 	OPAL_PHB_CAPI_MODE_SNOOP_OFF    = 2,
 	OPAL_PHB_CAPI_MODE_SNOOP_ON	= 3,
 	OPAL_PHB_CAPI_MODE_DMA		= 4,
+	OPAL_PHB_CAPI_MODE_DMA_TVT1	= 5,
 };
 
 /* CAPI feature flags (in device-tree) */
