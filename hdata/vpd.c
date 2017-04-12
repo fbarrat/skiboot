@@ -317,10 +317,16 @@ static void vpd_vini_parse(struct dt_node *node,
 			dt_add_property_string(node,
 				       "description", cinfo->description);
 		} else {
-			dt_add_property_string(node, "description", "Unknown");
-			prlog(PR_WARNING,
-				"VPD: CCIN desc not available for: %s\n",
-								(char *)kw);
+			kw = vpd_find(fruvpd, fruvpd_sz, "VINI", "DR", &sz);
+			if (kw) {
+				dt_add_property_nstr(node,
+						     "description", kw, sz);
+			} else {
+				dt_add_property_string(node, "description", "Unknown");
+				prlog(PR_WARNING,
+				      "VPD: CCIN desc not available for: %s\n",
+				      (char *)kw);
+			}
 		}
 	}
 
@@ -495,12 +501,17 @@ struct dt_node *dt_add_vpd_node(const struct HDIF_common_hdr *hdr,
 	return node;
 }
 
-static void dt_add_model_name(char *model)
+static void dt_add_model_name(void)
 {
 	const char *model_name = NULL;
 	const struct machine_info *mi;
 	const struct iplparams_sysparams *p;
 	const struct HDIF_common_hdr *iplp;
+	const struct dt_property *model;
+
+	model = dt_find_property(dt_root, "model");
+	if (!model)
+		goto def_model;
 
 	iplp = get_hdif(&spira.ntuples.ipl_parms, "IPLPMS");
 	if (!iplp)
@@ -515,12 +526,12 @@ static void dt_add_model_name(char *model)
 
 def_model:
 	if (!model_name || model_name[0] == '\0') {
-		mi = machine_info_lookup(model);
+		mi = machine_info_lookup(model->prop);
 		if (mi) {
 			model_name = mi->name;
 		} else {
 			model_name = "Unknown";
-			prlog(PR_WARNING, "VPD: Model name %s not known\n", model);
+			prlog(PR_WARNING, "VPD: Model name %s not known\n", model->prop);
 		}
 	}
 
@@ -535,9 +546,14 @@ static void sysvpd_parse_opp(const void *sysvpd, unsigned int sysvpd_sz)
 	v = vpd_find(sysvpd, sysvpd_sz, "OSYS", "MM", &sz);
 	if (v)
 		dt_add_property_nstr(dt_root, "model", v, sz);
+	else
+		dt_add_property_string(dt_root, "model", "Unknown");
+
 	v = vpd_find(sysvpd, sysvpd_sz, "OSYS", "SS", &sz);
 	if (v)
 		dt_add_property_nstr(dt_root, "system-id", v, sz);
+	else
+		dt_add_property_string(dt_root, "system-id", "Unknown");
 }
 
 
@@ -546,19 +562,12 @@ static void sysvpd_parse_legacy(const void *sysvpd, unsigned int sysvpd_sz)
 	const char *model;
 	const char *system_id;
 	const char *brand;
-	char *str;
 	uint8_t sz;
 
 	model = vpd_find(sysvpd, sysvpd_sz, "VSYS", "TM", &sz);
-	if (model) {
-		str = zalloc(sz + 1);
-		if (str) {
-			memcpy(str, model, sz);
-			dt_add_property_string(dt_root, "model", str);
-			dt_add_model_name(str);
-			free(str);
-		}
-	} else
+	if (model)
+		dt_add_property_nstr(dt_root, "model", model, sz);
+	else
 		dt_add_property_string(dt_root, "model", "Unknown");
 
 	system_id = vpd_find(sysvpd, sysvpd_sz, "VSYS", "SE", &sz);
@@ -608,6 +617,8 @@ static void sysvpd_parse(void)
 		sysvpd_parse_opp(sysvpd, sysvpd_sz);
 	} else
 		sysvpd_parse_legacy(sysvpd, sysvpd_sz);
+
+	dt_add_model_name();
 }
 
 static void iokid_vpd_parse(const struct HDIF_common_hdr *iohub_hdr)
