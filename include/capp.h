@@ -69,9 +69,10 @@ struct proc_chip;
 extern struct lock capi_lock;
 extern bool capp_ucode_loaded(struct proc_chip *chip, unsigned int index);
 
-extern int64_t _capp_load_ucode(unsigned int chip_id, uint32_t opal_id,
-				unsigned int index, u64 lidec, uint32_t reg_offset,
-				uint64_t apc_master_addr, uint64_t apc_master_write,
-				uint64_t snp_array_addr, uint64_t snp_array_write);
+extern int64_t capp_load_ucode(unsigned int chip_id, uint32_t opal_id,
+			       unsigned int index, u64 lid_eyecatcher, uint32_t reg_offset,
+			       uint64_t apc_master_addr, uint64_t apc_master_write,
+			       uint64_t snp_array_addr, uint64_t snp_array_write);
+
 
 #endif /* __CAPP_H */

@@ -2438,14 +2438,15 @@ static int64_t phb3_freset(struct pci_slot *slot)
 	return OPAL_HARDWARE;
 }
 
-static int64_t capp_load_ucode(struct phb3 *p)
+static int64_t load_capp_ucode(struct phb3 *p)
 {
 	int64_t rc;
 
 	if (p->index > PHB3_CAPP_MAX_PHB_INDEX(p))
 		return OPAL_HARDWARE;
 
-	rc = _capp_load_ucode(p->chip_id, p->phb.opal_id, p->index,
+	/* 0x434150504c494448 = 'CAPPLIDH' in ASCII */
+	rc = capp_load_ucode(p->chip_id, p->phb.opal_id, p->index,
 			0x434150504c494448, PHB3_CAPP_REG_OFFSET(p),
 			CAPP_APC_MASTER_ARRAY_ADDR_REG,
 			CAPP_APC_MASTER_ARRAY_WRITE_REG,
@@ -2464,7 +2465,7 @@ static void do_capp_recovery_scoms(struct phb3 *p)
 	offset = PHB3_CAPP_REG_OFFSET(p);
 	/* disable snoops */
 	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0);
-	capp_load_ucode(p);
+	load_capp_ucode(p);
 	/* clear err rpt reg*/
 	xscom_write(p->chip_id, CAPP_ERR_RPT_CLR + offset, 0);
 	/* clear capp fir */
@@ -4708,7 +4709,7 @@ static void phb3_create(struct dt_node *np)
 	phb3_init_hw(p, true);
 
 	/* Load capp microcode into capp unit */
-	capp_load_ucode(p);
+	load_capp_ucode(p);
 
 	opal_add_host_sync_notifier(phb3_host_sync_reset, p);
 

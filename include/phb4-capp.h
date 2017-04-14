@@ -41,8 +41,11 @@
 
 /* CAPP0 attached to PHB0(PEC0 - single port)
  * CAPP1 attached to PHB3(PEC2 - single or dual port)
- *
- * SCOM address Base (Ring = ‘0010’b)
+ */
+#define CAPP0_PHB_INDEX 0
+#define CAPP1_PHB_INDEX 3
+
+/* SCOM address Base (Ring = ‘0010’b)
  * CAPP Unit Satellite           SCOM address Base
  * CAPP 0    S1 (sat = ‘0000’b)  x02010800
  * CAPP 0    S2 (sat = ‘0001’b)  x02010840

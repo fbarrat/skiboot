@@ -130,10 +130,10 @@ end:
 	return ret;
 }
 
-int64_t _capp_load_ucode(unsigned int chip_id, uint32_t opal_id,
-			 unsigned int index, u64 lidec, uint32_t reg_offset,
-			 uint64_t apc_master_addr, uint64_t apc_master_write,
-			 uint64_t snp_array_addr, uint64_t snp_array_write)
+int64_t capp_load_ucode(unsigned int chip_id, uint32_t opal_id,
+			unsigned int index, u64 lid_eyecatcher, uint32_t reg_offset,
+			uint64_t apc_master_addr, uint64_t apc_master_write,
+			uint64_t snp_array_addr, uint64_t snp_array_write)
 {
 	struct proc_chip *chip = get_chip(chip_id);
 	struct capp_ucode_lid *ucode;
@@ -159,10 +159,7 @@ int64_t _capp_load_ucode(unsigned int chip_id, uint32_t opal_id,
 	 * find the ucode.  Otherwise this is the ucode.
 	 */
 	ucode = (struct capp_ucode_lid *)lid;
-	/* PHB3:  'CAPPLIDH' in ASCII
-	 * PHB4:  'CAPPPSLL' in ASCII
-	 */
-	if (be64_to_cpu(lid->eyecatcher) == lidec) {
+	if (be64_to_cpu(lid->eyecatcher) == lid_eyecatcher) {
 		if (be64_to_cpu(lid->version) != 0x1) {
 			PHBERR(opal_id, chip_id, index,
 			       "capi ucode lid header invalid\n");

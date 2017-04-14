@@ -2050,15 +2050,16 @@ static int64_t phb4_freset(struct pci_slot *slot)
 	return OPAL_HARDWARE;
 }
 
-static int64_t capp_load_ucode(struct phb4 *p)
+static int64_t load_capp_ucode(struct phb4 *p)
 {
 	int64_t rc;
 
-	if (p->index != 0 && p->index != 3)
+	if (p->index != CAPP0_PHB_INDEX && p->index != CAPP1_PHB_INDEX)
 		return OPAL_HARDWARE;
 
-	rc = _capp_load_ucode(p->chip_id, p->phb.opal_id, p->index,
-			0x434150504c494448, PHB4_CAPP_REG_OFFSET(p),
+	/* 0x4341505050534C4C = 'CAPPPSLL' in ASCII */
+	rc = capp_load_ucode(p->chip_id, p->phb.opal_id, p->index,
+			0x4341505050534C4C, PHB4_CAPP_REG_OFFSET(p),
 			CAPP_APC_MASTER_ARRAY_ADDR_REG,
 			CAPP_APC_MASTER_ARRAY_WRITE_REG,
 			CAPP_SNP_ARRAY_ADDR_REG,
@@ -2471,17 +2472,20 @@ static void phb4_init_capp_regs(struct phb4 *p)
 
 	offset = PHB4_CAPP_REG_OFFSET(p);
 
-	/* enable combined response examination (set by initfile) */
+	/* Enable cresp examination by CAPP */
 	xscom_read(p->chip_id, APC_MASTER_PB_CTRL + offset, &reg);
 	reg |= PPC_BIT(0);
-	xscom_write(p->chip_id, APC_MASTER_PB_CTRL + offset, reg);
+	if (p->rev == PHB4_REV_NIMBUS_DD10) {
+		/* disable vg not sys */
+		reg |= PPC_BIT(3);
+	}
+	/*xscom_write(p->chip_id, APC_MASTER_PB_CTRL + offset, reg);*/
+	xscom_write(p->chip_id, APC_MASTER_PB_CTRL + offset, 0x9200000000000000);
 
 	/* Set PHB mode, HPC Dir State and P9 mode */
-	xscom_write(p->chip_id, APC_MASTER_CAPI_CTRL + offset, 0x1072000000000000);
+	/*xscom_write(p->chip_id, APC_MASTER_CAPI_CTRL + offset, 0x1072000000000000);*/
+	xscom_write(p->chip_id, APC_MASTER_CAPI_CTRL + offset, 0x1772000000000000);
 	PHBINF(p, "CAPP: port attached\n");
-
-	/* should be enabled on LCO shifts only */
-	/* xscom_write(p->chip_id, LCO_MASTER_TARGET + offset, 0xFFF2000000000000); */
 
 	/* Set snoop ttype decoding , dir size to 256k */
 	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0xA000000000000000);
@@ -2491,11 +2495,16 @@ static void phb4_init_capp_regs(struct phb4 *p)
 	 */
 	xscom_write(p->chip_id, SNOOP_CONTROL + offset, 0x8000000010072000);
 
-	/* TLBI Hang Divider = 1 (initfile).  LPC buffers=0. X16 PCIe(14 buffers) */
-	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x401404000400000B);
+	/* TLBI Hang Divider = 1.  LPC buffers=0. X16 PCIe(14 buffers) */
+	/*xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x401404000400000B);*/
+	/*xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x081400000000000A);*/
+	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x081400000000000A);
 
 	/* Enable epoch timer */
-	xscom_write(p->chip_id, EPOCH_RECOVERY_TIMERS_CTRL + offset, 0xC0000000FFF0FFE0);
+	/*xscom_write(p->chip_id, EPOCH_RECOVERY_TIMERS_CTRL + offset, 0xC0000000FFF0FFE0);*/
+	xscom_write(p->chip_id, EPOCH_RECOVERY_TIMERS_CTRL + offset, 0xC0000000FFF0FFFE);
+
+	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x081400000000000B);
 
 	/* Deassert TLBI_FENCED and tlbi_psl_is_dead */
 	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, 0);
@@ -2555,7 +2564,10 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
 		PHBDBG(p, "Already in CAPP mode\n");
 
 	/* PEC Phase 3 (PBCQ) registers Init */
-	/* poll cqstat */
+	/* poll cqstat
+	 * CAPP0 attached to PHB0(PEC0)
+	 * CAPP1 attached to PHB3(PEC2)
+	 */
 	offset = 0x40;
 	if (p->index > 0 && p->index < 3)
 		offset = 0x80;
@@ -2576,8 +2588,14 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
 	/* Enable CAPP Mode , Set 14 CI Store buffers for CAPP,
 	 * Set 48 Read machines for CAPP.
 	 */
-	reg = 0x8000DFFFFFFFFFFFUll;
+	/*reg = 0x8000DFFFFFFFFFFFUll;*/
+	reg = 0x800EFFFFFFFFFFFF;
 	xscom_write(p->chip_id, p->pe_xscom + 0x7, reg);
+
+	/* Ignores the PB init signal */
+	xscom_read(p->chip_id, p->pe_xscom + 0x0, &reg);
+	reg |= PPC_BIT(12);
+ 	xscom_write(p->chip_id, p->pe_xscom + 0x0, reg);
 
 	/* PEC Phase 4 (PHB) registers adjustment
 	 * Bit [0:7] XSL_DSNCTL[capiind]
@@ -3620,7 +3638,7 @@ static void phb4_create(struct dt_node *np)
 	phb4_init_hw(p, true);
 
 	/* Load capp microcode into capp unit */
-	capp_load_ucode(p);
+	load_capp_ucode(p);
 
 	/* Register all interrupt sources with XIVE */
 	xive_register_hw_source(p->base_msi, p->num_irqs - 8, 16,
