@@ -1700,11 +1700,11 @@ static void npu2_opencapi_probe(struct dt_node *dn)
 	links = dt_prop_get_u32(dn, "ibm,npu-links");
 
 	/* Don't try to init when we have an NVLink link */
-	dt_for_each_compatible(dn, link, "ibm,npu-link") {
-		prlog(PR_DEBUG, "OCAPI: NPU%d: NVLink link found, skipping\n",
-		      index);
-		return;
-	}
+	/* dt_for_each_compatible(dn, link, "ibm,npu-link") { */
+	/* 	prlog(PR_DEBUG, "OCAPI: NPU%d: NVLink link found, skipping\n", */
+	/* 	      index); */
+	/* 	return; */
+	/* } */
 
 	path = dt_get_path(dn);
 	prlog(PR_INFO, "OCAPI: Chip %d Found OpenCAPI NPU%d (%d links) at %s\n",

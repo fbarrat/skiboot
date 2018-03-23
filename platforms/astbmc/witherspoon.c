@@ -30,6 +30,29 @@
 
 #include "astbmc.h"
 
+
+const struct platform_ocapi witherspoon_ocapi = {
+	.i2c_engine	= 1,
+	.i2c_port	= 4,
+	.i2c_reset_addr = 0x20,
+	/*
+	 * Opencapi reset on witherspoon is triggered through i2c,by
+	 * using the GPU_INT pins. There are 3 pins per CPU, one for
+	 * each GPU (GPU0, GPU1, GPU2). On redbud, we only have GPU0
+	 * and GPU1.
+	 *
+	 * Only the "middle" lane group is compatible with the Acorn
+	 * adapter. On obus0, it maps to ODL0 and GPU0, and on obus3,
+	 * it maps to ODL1 and GPU1. So we get lucky, an odl number
+	 * always identify a unique GPU/Acorn slot.
+	 */
+	.i2c_reset_odl0 = (1 << 0), /* GPU0 */
+	.i2c_reset_odl1 = (1 << 1), /* GPU1 */
+	.force_presence = true,
+	.odl_phy_swap	= false,
+};
+
+
 /*
  * HACK: Hostboot doesn't export the correct data for the system VPD EEPROM
  *       for this system. So we need to work around it here.
@@ -48,6 +71,59 @@ static void vpd_dt_fixup(void)
 	}
 }
 
+static void create_ocapi_i2c_bus(void)
+{
+	struct dt_node *xscom, *i2cm, *i2c_bus;
+
+	prlog(PR_DEBUG, "OCAPI: Adding i2c bus to device tree\n");
+
+	dt_for_each_compatible(dt_root, xscom, "ibm,xscom") {
+		i2cm = dt_find_by_name(xscom, "i2cm@a1000");
+		if (!i2cm) {
+			prlog(PR_ERR, "OCAPI: i2c master for adapter reset not found\n");
+			continue;
+		}
+
+		if (dt_find_by_name(i2cm, "i2c-bus@4"))
+			continue;
+
+		i2c_bus = dt_new_addr(i2cm, "i2c-bus", 4);
+		dt_add_property_cells(i2c_bus, "reg", 4);
+		dt_add_property_cells(i2c_bus, "bus-frequency", 0x61a80);
+		dt_add_property_strings(i2c_bus, "compatible",
+					"ibm,opal-i2c", "ibm,power8-i2c-port",
+					"ibm,power9-i2c-port");
+	}
+}
+
+static void fix_ocapi_link(void)
+{
+	struct dt_node *link;
+	struct dt_property *prop;
+
+	prlog(PR_INFO, "OCAPI: making GPU1 slot opencapi-compatible\n");
+
+	link = dt_find_by_name(dt_root, "link@4");
+	if (!link) {
+		prlog(PR_ERR, "OCAPI: cannot find link4 to modify\n");
+		return;
+	}
+
+	/*
+	 * On redbud, GPU1 is the middle-group lanes on obus3. The
+	 * lane mask we get from hostboot for link 4 is correct.
+	 */
+
+	/* fix link type */
+	prop = __dt_find_property(link, "compatible");
+	if (!prop) {
+		prlog(PR_ERR, "OCAPI: cannot find compatible prop in link\n");
+		return;
+	}
+	dt_del_property(link, prop);
+	dt_add_property_string(link, "compatible", "ibm,npu-link-opencapi");
+}
+
 static bool witherspoon_probe(void)
 {
 	if (!dt_node_is_compatible(dt_root, "ibm,witherspoon"))
@@ -61,6 +137,9 @@ static bool witherspoon_probe(void)
 
 	vpd_dt_fixup();
 
+	/* opencapi fixup */
+	create_ocapi_i2c_bus();
+	fix_ocapi_link();
 	return true;
 }
 
@@ -169,4 +248,5 @@ DECLARE_PLATFORM(witherspoon) = {
 	.terminate		= ipmi_terminate,
 
 	.pci_get_slot_info	= dt_slot_get_slot_info,
+	.ocapi			= &witherspoon_ocapi,
 };
