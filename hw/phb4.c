@@ -3835,8 +3835,17 @@ static void phb4_init_capp_regs(struct phb4 *p, uint32_t capp_eng)
 /* override some inits with CAPI defaults */
 static void phb4_init_capp_errors(struct phb4 *p)
 {
+	/* Init_67:  REGB Error ERC Enable Register */
+	out_be64(p->regs + 0x1c28,	0x0000000000000000ull);
+
+	/* Init_68:  REGB Error FAT Enable Register */
+	out_be64(p->regs + 0x1c30,	0xde8000110357403full);
+
 	/* Init_77: TXE Error AIB Fence Enable Register */
 	out_be64(p->regs + 0x0d30,	0xdff7bf0ff7ddfff0ull);
+
+	/* Init_84: RXE_ARB Error EEH Freeze Enable Register */
+	out_be64(p->regs + 0x0da8,	0xc00008b801000060ull);
 
 	/* Init_86: RXE_ARB Error AIB Fence Enable Register */
 	out_be64(p->regs + 0x0db0,	0xfbffd7bbfb7fbfefull);
@@ -3849,6 +3858,9 @@ static void phb4_init_capp_errors(struct phb4 *p)
 
 	/* Init_113: PHB Error AIB Fence Enable Register */
 	out_be64(p->regs + 0x0cb0,	0x35777073ff000000ull);
+
+	/* Init_128: RXE_ARB Error System Interrupt Enable Register */
+	out_be64(p->regs + 0x0da0,	0xc40028fc01804070ull);
 }
 
  /*
