@@ -572,6 +572,8 @@ void tpm_i2c_nuvoton_probe(void)
 			      "found, tpm node parent %p\n", node->parent);
 			goto disable;
 		}
+		prlog(PR_ERR, "HACK ALERT: nuvoton, don't register!\n");
+		continue;
 		if (tpm_register_chip(node, tpm_device,
 				      &tpm_i2c_nuvoton_driver)) {
 			free(tpm_device);
