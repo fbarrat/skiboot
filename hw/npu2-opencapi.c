@@ -824,11 +824,11 @@ static void assert_reset(struct npu2_dev *dev)
 
 	switch (dev->index) {
 	case 2:
-	case 4:
+	case 5:
 		pin = platform.ocapi->i2c_reset_odl0;
 		break;
 	case 3:
-	case 5:
+	case 4:
 		pin = platform.ocapi->i2c_reset_odl1;
 		break;
 	default:
