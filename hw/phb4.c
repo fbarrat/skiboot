@@ -3861,6 +3861,11 @@ static void phb4_init_capp_errors(struct phb4 *p)
 
 	/* Init_128: RXE_ARB Error System Interrupt Enable Register */
 	out_be64(p->regs + 0x0da0,	0xc40028fc01804070ull);
+
+	prlog(PR_INFO, "CAPI: forcing checkstop on any error (take 2)\n");
+	xscom_write(p->chip_id, p->pe_stk_xscom + XPEC_NEST_STK_PCI_NFIR_ACTION0, 0);
+	xscom_write(p->chip_id, p->pe_stk_xscom + XPEC_NEST_STK_PCI_NFIR_ACTION1, 0);
+	xscom_write(p->chip_id, p->pe_stk_xscom + XPEC_NEST_STK_PCI_NFIR_MSK, 0);
 }
 
  /*
