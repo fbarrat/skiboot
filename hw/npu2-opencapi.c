@@ -1757,11 +1757,33 @@ static void setup_debug_training_state(struct npu2_dev *dev)
 	}
 }
 
+static void get_lpc_address(struct npu2_dev *dev, uint64_t *base,
+			       uint64_t *size)
+{
+	uint64_t val;
+
+	/*
+	 * The supported chip address extension mask is 1100 100 (mask
+	 * off 2 bits from group ID and 1 bit from chip ID).
+	 *
+	 * Fall back to only permitting a single allocation if we
+	 * don't see this mask value.
+	 */
+	xscom_read(dev->npu->chip_id, PB_CENT_MODE, &val);
+	if (GETFIELD(PB_CFG_CHIP_ADDR_EXTENSION_MASK_CENT, val) == 0b1100100)
+		phys_map_get(dev->npu->chip_id, OCAPI_MEM,
+			     dev->brick_index - 2, base, size);
+	else
+		phys_map_get(dev->npu->chip_id, OCAPI_MEM,
+			     0, base, size);
+}
+
 static void setup_device(struct npu2_dev *dev)
 {
-	struct dt_node *dn_phb;
+	struct dt_node *dn_phb, *dn_mem;
 	struct pci_slot *slot;
 	uint64_t mm_win[2];
+	uint64_t phys_map_base, phys_map_size;
 
 	/* Populate PHB device node */
 	phys_map_get(dev->npu->chip_id, NPU_OCAPI_MMIO, dev->brick_index, &mm_win[0],
@@ -1793,6 +1815,11 @@ static void setup_device(struct npu2_dev *dev)
 	dt_add_property_cells(dn_phb, "ibm,links", 1);
 	dt_add_property(dn_phb, "ibm,mmio-window", mm_win, sizeof(mm_win));
 	dt_add_property_cells(dn_phb, "ibm,phb-diag-data-size", 0);
+
+	get_lpc_address(dev, &phys_map_base, &phys_map_size);
+	dn_mem = npu2_create_memory_dn(phys_map_base, phys_map_size);
+	assert(dn_mem);
+	dt_add_property_cells(dn_phb, "memory-region", dn_mem->phandle);
 
 	/*
 	 * We ignore whatever PE numbers Linux tries to set, so we just
@@ -2251,11 +2278,7 @@ static int64_t alloc_mem_bar(struct npu2_dev *dev, uint64_t size, uint64_t *bar)
 	 * don't see this mask value.
 	 */
 	xscom_read(dev->npu->chip_id, PB_CENT_MODE, &val);
-	if (GETFIELD(PB_CFG_CHIP_ADDR_EXTENSION_MASK_CENT, val) == 0b1100100) {
-		phys_map_get(dev->npu->chip_id, OCAPI_MEM,
-			     dev->brick_index - 2, &phys_map_base,
-			     &phys_map_size);
-	} else {
+	if (GETFIELD(PB_CFG_CHIP_ADDR_EXTENSION_MASK_CENT, val) != 0b1100100) {
 		bool in_use = false;
 
 		for (int i = 0; i < dev->npu->total_devices; i++) {
@@ -2268,10 +2291,8 @@ static int64_t alloc_mem_bar(struct npu2_dev *dev, uint64_t size, uint64_t *bar)
 			rc = OPAL_RESOURCE;
 			goto out;
 		}
-
-		phys_map_get(dev->npu->chip_id, OCAPI_MEM, 0, &phys_map_base,
-			     &phys_map_size);
 	}
+	get_lpc_address(dev, &phys_map_base, &phys_map_size);
 
 	if (size > phys_map_size) {
 		/**
